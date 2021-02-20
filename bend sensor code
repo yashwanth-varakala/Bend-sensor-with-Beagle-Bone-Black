@@ -1,0 +1,265 @@
+#include<unistd.h>
+#include<fcntl.h>
+#include<sys/ioctl.h>
+#include<linux/i2c-dev.h>
+#include<stdio.h>
+#include<stdint.h>
+#include<iobb.h>
+#include <stdbool.h>
+#include<math.h>
+#include<time.h>
+
+#define address (0x12) // bend sensor address  as slave address
+#define bendsensor "/dev/i2c-2"
+//unsigned char buffer_bend[3];  // extension
+
+//clock_t begin = clock();
+
+uint8_t ADS_TRANSFER_SIZE=3;
+int file_i2c;
+bool setSampleRate(uint16_t sps);
+
+
+//removable
+bool inFreeRun = false;
+
+
+uint8_t buffer[3];
+
+typedef enum
+{
+  ADS_1_HZ = 16384,
+  ADS_10_HZ = 1638,
+  ADS_20_HZ = 819,
+  ADS_50_HZ = 327,
+  ADS_100_HZ = 163,
+  ADS_200_HZ = 81,
+  ADS_333_HZ = 49,
+  ADS_500_HZ = 32,
+} ADS_SPS_T;
+
+
+typedef enum {
+		ADS_SAMPLE = 0,
+		ADS_FW_VER,
+		ADS_DEV_ID,
+		ADS_STRETCH_SAMPLE } ADS_PACKET_T;
+
+typedef enum
+{
+  ADS_ONE_AXIS = 1}  ADS_DEV_IDS_T;
+
+
+typedef enum
+{
+  ADS_RUN = 0,
+  ADS_SPS,
+  ADS_RESET,
+  ADS_DFU,
+  ADS_SET_ADDRESS,
+  ADS_POLL,  // ADS_INTERRUPT_ENABLE
+  ADS_GET_FW_VER,
+  ADS_CALIBRATE,
+  ADS_AXES_ENABLED,
+  ADS_SHUTDOWN,
+  ADS_GET_DEV_ID
+} ADS_COMMAND_T;
+
+ float filter_samples[2][6];		// Filter samples
+   float prev_sample[2];
+void processNewData();
+bool setSampleRate(uint16_t sps);
+bool writeBuffer(uint8_t *buffer, uint8_t len);
+bool beginReadingData(bool run);
+void deadzoneFilter(volatile float *sample);
+void signalFilter(volatile float *sample);
+ADS_DEV_IDS_T axisAmount;
+int16_t ads_int16_decode(const uint8_t *p_encoded_data);
+
+volatile float final[2];
+bool run();
+int16_t temp;
+//until here
+
+
+
+
+int main(){
+
+    clock_t begin = clock();
+    int z=0;
+    if((file_i2c= open(bendsensor,O_RDWR))<0)
+	{
+		printf("Failed to open the i2c bus to connect bend sensor\n");
+		return -1;
+	}
+
+	if(ioctl(file_i2c,I2C_SLAVE,address)<0)
+
+	{
+		printf("Failed to acquire bus access and talk to the slave\n");
+		return -1;
+
+	}
+
+    setSampleRate(ADS_100_HZ);
+	run();
+   // printf("initialized and connected");
+
+//	iolib_delay_ms(2);
+
+
+    while(z<10){
+//	    clock_t begin = clock();
+
+		   if (read(file_i2c,buffer ,ADS_TRANSFER_SIZE)!=ADS_TRANSFER_SIZE)
+	    {
+		    printf("error");
+	    }
+	    else if(buffer[0] == ADS_SAMPLE){
+
+	  temp = ads_int16_decode(&buffer[1]);
+     final[0] = (float)temp / 64.0f;
+
+     final[1] = 0.0f;
+   
+
+
+
+
+        processNewData();
+
+
+	
+	    printf("\nBefore casting:%ld\t Final:%.2f\n", temp, final[0]);
+
+  //          fwrite(final[0],sizeof(unsigned char),3, stdout);// extension
+
+	     }
+
+	  else if(buffer[0]== ADS_STRETCH_SAMPLE){
+
+                   	  temp = ads_int16_decode(&buffer[1]);
+     final[0] = (float)temp / 64.0f;
+
+     final[1] = 0.0f;
+
+           processNewData();
+
+		   printf("%ld\t %.2f", temp, final);
+
+
+   }
+	  else {
+		  printf("ADS_ERR");
+	    }
+       
+	 clock_t end = clock();
+	double time_spent = (double)(end-begin)/CLOCKS_PER_SEC;
+	
+
+       printf("begin is %lf end is %lf timespent is %lf", begin, end, time_spent);	
+z++;
+   //  time_spent=+time_spent;
+ //  printf("addedtimespent %lf",time_spent);
+    }close(file_i2c);} //}} }works even without closing the file
+
+
+
+
+
+
+bool setSampleRate(uint16_t sps)
+{
+  uint8_t buffer[ADS_TRANSFER_SIZE];
+
+  buffer[0] = ADS_SPS;
+
+  //SPS is loaded little endian
+  buffer[1] = (uint8_t)((sps & 0x00FF) >> 0);
+  buffer[2] = (uint8_t)((sps & 0xFF00) >> 8);
+
+  return writeBuffer(buffer, ADS_TRANSFER_SIZE);
+}
+
+bool writeBuffer(uint8_t *buffer, uint8_t len)
+{
+
+
+
+uint8_t bytesWritten = write(file_i2c, buffer, len);
+
+
+  if (bytesWritten == len)
+    return true;
+  return false;
+}
+
+bool beginReadingData(bool run)
+{
+  uint8_t buffer[ADS_TRANSFER_SIZE];
+
+  buffer[0] = ADS_RUN;
+  buffer[1] = run;
+
+  return writeBuffer(buffer, ADS_TRANSFER_SIZE);
+}
+
+
+bool run()
+{
+  inFreeRun = true;
+  return (beginReadingData(true));
+}
+
+
+void processNewData()
+{
+  // Low pass IIR filter
+  signalFilter(final);
+
+  // Deadzone filter
+  deadzoneFilter(final);
+
+  //currentSample 0 and 1 are now ready to be read
+}
+
+// Low pass IIR filter
+void signalFilter(volatile float *sample)
+{
+  for (uint8_t i = 0; i < axisAmount; i++)
+  {
+    filter_samples[i][5] = filter_samples[i][4];
+    filter_samples[i][4] = filter_samples[i][3];
+    filter_samples[i][3] = (float)sample[i];
+    filter_samples[i][2] = filter_samples[i][1];
+    filter_samples[i][1] = filter_samples[i][0];
+
+    // 20 Hz cutoff frequency @ 100 Hz Sample Rate
+    filter_samples[i][0] = filter_samples[i][1] * (0.36952737735124147f) - 0.19581571265583314f * filter_samples[i][2] +
+                           0.20657208382614792f * (filter_samples[i][3] + 2 * filter_samples[i][4] + filter_samples[i][5]);
+
+    sample[i] = filter_samples[i][0];
+  }
+}
+
+// Deadzone filter
+void deadzoneFilter(volatile float *sample)
+{
+  float dead_zone = 0.5f;
+
+  for (uint8_t i = 0; i < axisAmount; i++)
+  {
+    if (fabs(sample[i] - prev_sample[i]) > dead_zone)
+      prev_sample[i] = sample[i];
+    else
+      sample[i] = prev_sample[i];
+  }
+}
+
+
+ int16_t ads_int16_decode(const uint8_t *p_encoded_data)
+{
+  return ((((uint16_t)(p_encoded_data)[0])) |
+          (((int16_t)(p_encoded_data)[1]) << 8));
+}
